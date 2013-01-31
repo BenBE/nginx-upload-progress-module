@@ -31,6 +31,8 @@ struct ngx_http_uploadprogress_node_s {
     off_t                            rest;
     off_t                            length;
     ngx_uint_t                       done;
+    ngx_uint_t                       sequence;
+    ngx_uint_t                       sent_portion;
     time_t                           timeout;
     struct ngx_http_uploadprogress_node_s *prev;
     struct ngx_http_uploadprogress_node_s *next;
@@ -66,6 +68,9 @@ typedef struct {
     ngx_array_t                      templates;
     ngx_str_t                        header;
     ngx_str_t                        header_mul;
+
+    ngx_addr_t                       progress_server;
+    int                              udp_socket;
 
     ngx_str_t                        jsonp_parameter;
     ngx_uint_t                       json_multiple;
@@ -125,7 +130,7 @@ static ngx_command_t ngx_http_uploadprogress_commands[] = {
      NULL},
 
     {ngx_string("track_uploads"),
-     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2,
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2 | NGX_CONF_TAKE3,
      ngx_http_track_uploads,
      NGX_HTTP_LOC_CONF_OFFSET,
      0,
@@ -612,6 +617,29 @@ static void ngx_http_uploadprogress_event_handler(ngx_http_request_t *r)
             up->length = r->headers_in.content_length_n;
         }
 
+        if (
+            upcf->udp_socket != -1 &&
+            upcf->progress_server.socklen != 0
+        ) {
+            u_char      datagram_buf[1024];
+            u_char *    end;
+            off_t       uploaded;
+            ngx_uint_t  portion;
+
+            uploaded = up->length - up->rest;
+            portion = up->length ? 100 * uploaded / up->length : 100;
+
+            if (portion > up->sent_portion) {
+                end = ngx_snprintf(
+                    datagram_buf, sizeof(datagram_buf),
+                    "{\"id\" : \"%V\", \"sequence\" : %d, \"size\" : %uO, \"uploaded\" : %uO }",
+                    id, up->sequence, up->length, uploaded);
+                sendto(upcf->udp_socket, datagram_buf, end - datagram_buf, 0, (struct sockaddr*)upcf->progress_server.sockaddr, upcf->progress_server.socklen);
+                up->sent_portion = portion;
+                ++up->sequence;
+            }
+        }
+
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
             "upload-progress: read_event_handler storing rest %uO/%uO for %V",
             up->rest, up->length, id);
@@ -619,6 +647,7 @@ static void ngx_http_uploadprogress_event_handler(ngx_http_request_t *r)
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
             "upload-progress: read_event_handler not found: %V", id);
     }
+
     ngx_shmtx_unlock(&shpool->mutex);
     ngx_http_uploadprogress_strdupfree(id);
 }
@@ -1109,6 +1138,8 @@ ngx_http_uploadprogress_handler(ngx_http_request_t * r)
     up->rest = 0;
     up->length = 0;
     up->timeout = 0;
+    up->sequence = 0;
+    up->sent_portion = 0;
 
     /* Properly handles small files where no read events happen after the */
     /* request is first handled (apparently this can happen on linux with epoll) */
@@ -1448,6 +1479,8 @@ ngx_http_uploadprogress_errortracker(ngx_http_request_t * r)
         up->rest = 0;
         up->length = 0;
         up->timeout = 0;
+        up->sequence = 0;
+        up->sent_portion = 0;
 
         ngx_memcpy(up->data, id->data, id->len);
 
@@ -1539,6 +1572,7 @@ ngx_http_uploadprogress_create_loc_conf(ngx_conf_t * cf)
         elt->values = NULL;
         elt->lengths = NULL;
     }
+    conf->udp_socket = -1;
 
     return conf;
 }
@@ -1701,6 +1735,7 @@ ngx_http_track_uploads(ngx_conf_t * cf, ngx_command_t * cmd, void *conf)
     ngx_http_core_loc_conf_t        *clcf;
     ngx_http_uploadprogress_conf_t  *lzcf = conf;
     ngx_str_t                       *value;
+    ngx_url_t                       url;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0, "ngx_track_uploads in");
 
@@ -1725,6 +1760,24 @@ ngx_http_track_uploads(ngx_conf_t * cf, ngx_command_t * cmd, void *conf)
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
             "track_uploads \"%V\" timeout value invalid", &value[2]);
         return NGX_CONF_ERROR;
+    }
+
+    if (cf->args->nelts > 3) {
+        ngx_memzero(&url, sizeof(ngx_url_t));
+        url.url = value[3];
+        url.default_port = 80;
+        url.no_resolve = 0;
+
+        if (ngx_parse_url(cf->pool, &url) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "Invalid graphite server %V: %s", &url.host, url.err);
+            return NGX_CONF_ERROR;
+        }
+
+        lzcf->progress_server = url.addrs[0];
+        if (lzcf->udp_socket == -1) {
+            lzcf->udp_socket = ngx_socket(PF_INET, SOCK_DGRAM, 0);
+        }
     }
 
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
